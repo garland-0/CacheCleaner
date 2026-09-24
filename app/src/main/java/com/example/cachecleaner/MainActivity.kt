@@ -184,7 +184,7 @@ fun HomeScreen() {
 
     suspend fun clearSelected() {
         val targets = apps.filter { it.selected }
-        if (targets.isEmpty() || clearing) return
+        if (clearing || (targets.isEmpty() && !perAppBlocked)) return
         clearing = true
         freedBytes = 0L
         progress = 0f
@@ -234,13 +234,13 @@ fun HomeScreen() {
             }
 
             // Step 1: on the biggest cache, find a per-app method that really works.
-            val first = targets.first()
-            currentLabel = first.label
-            currentIcon = first.icon
-            val firstBefore = if (first.cacheBytes > 0L) first.cacheBytes else querySize(first.packageName)
-            if (perAppBlocked) {
-                notes += "PER-APP: skipped (blocked earlier)"
-            } else {
+            val wasBlocked = perAppBlocked
+            val first = targets.firstOrNull()
+            var firstBefore = 0L
+            if (!wasBlocked && first != null) {
+                currentLabel = first.label
+                currentIcon = first.icon
+                firstBefore = if (first.cacheBytes > 0L) first.cacheBytes else querySize(first.packageName)
                 statusLine = "TESTING CLEAR METHOD"
                 for (m in listOf("API", "SHELL")) {
                     val r = runMethod(m, first.packageName)
@@ -270,7 +270,7 @@ fun HomeScreen() {
             }
 
             // Step 2: run the working method on every selected app, or trim everything.
-            if (method.isNotEmpty()) {
+            if (method.isNotEmpty() && first != null) {
                 account(first, firstBefore, true)
                 for ((i, entry) in targets.withIndex()) {
                     if (entry.packageName == first.packageName) continue
@@ -287,11 +287,10 @@ fun HomeScreen() {
                 method = "TRIM"
                 currentLabel = "All apps"
                 currentIcon = null
-                statusLine = "PER-APP BLOCKED - CHECKING"
+                statusLine = "TRIMMING ALL CACHES"
                 progress = 0.2f
-                diag = ShizukuCache.diagnose(pm)
+                if (!wasBlocked) diag = ShizukuCache.diagnose(pm)
                 sizesBefore = sweep()
-                statusLine = "PER-APP BLOCKED - TRIMMING ALL"
                 progress = 0.5f
                 var r = ShizukuCache.trimAllShell()
                 notes += "TRIM shell: " + (if (r.ok) "ok" else r.note)
@@ -299,50 +298,49 @@ fun HomeScreen() {
                     r = ShizukuCache.trimAllApi(iPm)
                     notes += "TRIM api: " + (if (r.ok) "ok" else r.note)
                 }
-                statusLine = "CLEARING EXTERNAL CACHES"
-                progress = 0.8f
-                val er = ShizukuCache.clearExternalCacheShell(targets.map { it.packageName })
-                notes += "EXTERNAL: " + (if (er.ok) er.note else "failed " + er.note)
             }
 
             progress = 1f
             refresh()
 
             if (method == "TRIM") {
-                // Judge everything by real before/after sizes.
+                // Trim works on all apps at once, so judge it by real before/after sizes.
                 val afterMap = apps.associate { it.packageName to it.cacheBytes }
-                var allFreed = 0L
                 var changed = 0
                 for ((pkg, b) in sizesBefore) {
                     if (b <= 0L) continue
                     val a = afterMap[pkg] ?: 0L
                     if (a in 0L until b) {
-                        allFreed += b - a
+                        freedBytes += b - a
                         changed++
                     }
                 }
-                notes += "ALL APPS: freed " + formatBytes(allFreed) + " in " + changed + " apps"
+                okCount = changed
                 for (t in targets) {
                     val b = sizesBefore[t.packageName] ?: t.cacheBytes
                     val a = afterMap[t.packageName] ?: 0L
-                    val ok = b > 0L && a in 0L until b
-                    results[t.packageName] = ok
-                    if (ok) {
-                        okCount++
-                        freedBytes += b - a
-                    }
+                    if (b > 0L && a in 0L until b) results[t.packageName] = true
+                }
+                val left = apps.filter { it.cacheBytes > 0L }.take(3)
+                if (left.isNotEmpty()) {
+                    notes += "LEFT: " + left.joinToString(", ") { it.label + " " + formatBytes(it.cacheBytes) }
+                    notes += "TRIM CAN'T REACH THESE ON THIS PHONE"
                 }
             }
 
             val methodLabel = when (method) {
                 "API" -> "DIRECT API"
                 "SHELL" -> "SHELL COMMAND"
-                "TRIM" -> "TRIM ALL + EXTERNAL"
+                "TRIM" -> "TRIM ALL APPS"
                 else -> "NONE"
             }
             statusLine = "DONE"
             report = buildString {
-                append("CLEARED ").append(okCount).append(" OF ").append(targets.size)
+                if (method == "TRIM") {
+                    if (okCount == 0) append("NOTHING LEFT TO TRIM") else append("TRIMMED ").append(okCount).append(" APPS")
+                } else {
+                    append("CLEARED ").append(okCount).append(" OF ").append(targets.size)
+                }
                 append("  |  FREED ").append(formatBytes(freedBytes))
                 append("\nMETHOD: ").append(methodLabel)
                 for (n in notes) append("\n").append(n)

@@ -160,24 +160,6 @@ object ShizukuCache {
         return ApiResult(r.code == 0, oneLine(r.out.ifEmpty { "exit ${r.code}" }))
     }
 
-    /**
-     * Last-resort helper for the external part of an app's cache (Android/data/<pkg>/cache),
-     * the only part the shell user can delete directly. Internal cache needs the system API.
-     */
-    suspend fun clearExternalCacheShell(pkgs: List<String>): ApiResult {
-        val safe = pkgs.filter { PKG_OK.matches(it) }
-        if (safe.isEmpty()) return ApiResult(false, "nothing to clean")
-        val script = "for p in " + safe.joinToString(" ") +
-            "; do d=/sdcard/Android/data/\$p/cache; " +
-            "[ -d \"\$d\" ] && rm -rf \"\$d\"/* \"\$d\"/.[!.]*; done; echo DONE"
-        val r = shell("($script) 2>&1", 60_000L)
-        val extra = r.out.replace("DONE", "").trim()
-        return ApiResult(
-            r.out.contains("DONE"),
-            if (extra.isEmpty()) "ran on ${safe.size} apps" else oneLine(extra).take(70)
-        )
-    }
-
     /** Short facts about this phone that explain why a clear method is blocked. */
     suspend fun diagnose(pm: PackageManager): String = withContext(Dispatchers.IO) {
         val sb = StringBuilder()
