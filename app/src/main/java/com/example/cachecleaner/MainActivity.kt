@@ -1,5 +1,7 @@
 package com.example.cachecleaner
 
+import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.shadow
 import android.app.AppOpsManager
 import android.app.usage.StorageStatsManager
 import android.content.Context
