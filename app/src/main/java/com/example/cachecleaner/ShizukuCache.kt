@@ -1,6 +1,8 @@
 package com.example.cachecleaner
 
+import android.content.pm.PackageManager
 import android.os.Binder
+import android.os.Build
 import android.os.IBinder
 import android.os.Parcel
 import kotlinx.coroutines.Dispatchers
@@ -148,7 +150,7 @@ object ShizukuCache {
     /** Per-app clear: `cmd package clear --cache-only` (same call `pm clear --cache-only` makes). */
     suspend fun clearCacheShell(pkg: String, userId: Int): ApiResult {
         if (!PKG_OK.matches(pkg)) return ApiResult(false, "bad package name")
-        val r = shell("cmd package clear --cache-only --user $userId $pkg 2>&1")
+        val r = shell("cmd package clear --cache-only --user $userId $pkg 2>&1", 8_000L)
         return ApiResult(r.code == 0 && r.out.contains("Success"), oneLine(r.out.ifEmpty { "exit ${r.code}" }))
     }
 
@@ -156,6 +158,47 @@ object ShizukuCache {
     suspend fun trimAllShell(): ApiResult {
         val r = shell("cmd package trim-caches 999G 2>&1", 120_000L)
         return ApiResult(r.code == 0, oneLine(r.out.ifEmpty { "exit ${r.code}" }))
+    }
+
+    /**
+     * Last-resort helper for the external part of an app's cache (Android/data/<pkg>/cache),
+     * the only part the shell user can delete directly. Internal cache needs the system API.
+     */
+    suspend fun clearExternalCacheShell(pkgs: List<String>): ApiResult {
+        val safe = pkgs.filter { PKG_OK.matches(it) }
+        if (safe.isEmpty()) return ApiResult(false, "nothing to clean")
+        val script = "for p in " + safe.joinToString(" ") +
+            "; do d=/sdcard/Android/data/\$p/cache; " +
+            "[ -d \"\$d\" ] && rm -rf \"\$d\"/* \"\$d\"/.[!.]*; done; echo DONE"
+        val r = shell("($script) 2>&1", 60_000L)
+        val extra = r.out.replace("DONE", "").trim()
+        return ApiResult(
+            r.out.contains("DONE"),
+            if (extra.isEmpty()) "ran on ${safe.size} apps" else oneLine(extra).take(70)
+        )
+    }
+
+    /** Short facts about this phone that explain why a clear method is blocked. */
+    suspend fun diagnose(pm: PackageManager): String = withContext(Dispatchers.IO) {
+        val sb = StringBuilder()
+        sb.append("ANDROID ").append(Build.VERSION.RELEASE)
+            .append(" / SDK ").append(Build.VERSION.SDK_INT)
+            .append(" / ").append(Build.MANUFACTURER.uppercase())
+        sb.append("\nSHIZUKU UID ").append(runCatching { Shizuku.getUid() }.getOrDefault(-1))
+        for (p in listOf("INTERNAL_DELETE_CACHE_FILES", "DELETE_CACHE_FILES", "CLEAR_APP_CACHE")) {
+            val res = runCatching { pm.checkPermission("android.permission.$p", "com.android.shell") }
+                .getOrDefault(-99)
+            val txt = when (res) {
+                PackageManager.PERMISSION_GRANTED -> "YES"
+                PackageManager.PERMISSION_DENIED -> "NO"
+                else -> "?"
+            }
+            sb.append("\nSHELL ").append(p).append(": ").append(txt)
+        }
+        val lg = shell("logcat -d -b system 2>&1 | grep -F 'Only system apps can use' | tail -n 1", 10_000L)
+        sb.append("\nLOG: ")
+            .append(if (lg.out.contains("Only system apps")) "ignore message FOUND" else "ignore message not found")
+        sb.toString()
     }
 
     // Shizuku.newProcess is private in API 13+, so it is reached by reflection.

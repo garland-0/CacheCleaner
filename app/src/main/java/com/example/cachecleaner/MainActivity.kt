@@ -125,6 +125,7 @@ fun HomeScreen() {
     var progress by remember { mutableFloatStateOf(0f) }
     var freedBytes by remember { mutableLongStateOf(0L) }
     var report by remember { mutableStateOf("") }
+    var perAppBlocked by remember { mutableStateOf(false) }
     var selectAll by remember { mutableStateOf(true) }
     val apps = remember { mutableStateListOf<AppEntry>() }
     val results = remember { mutableStateMapOf<String, Boolean>() }
@@ -144,10 +145,21 @@ fun HomeScreen() {
         }
     }
 
+    /** Cache size of every installed app whose size could be read. */
+    suspend fun sweep(): Map<String, Long> = withContext(Dispatchers.IO) {
+        val sizes = HashMap<String, Long>()
+        for (app in pm.getInstalledApplications(PackageManager.GET_META_DATA)) {
+            val sz = querySize(app.packageName)
+            if (sz >= 0L) sizes[app.packageName] = sz
+        }
+        sizes
+    }
+
     suspend fun refresh() {
         if (loading) return
         loading = true
         try {
+            val prevSel = apps.associate { it.packageName to it.selected }
             val list = withContext(Dispatchers.IO) {
                 pm.getInstalledApplications(PackageManager.GET_META_DATA).mapNotNull { app ->
                     val label = runCatching { app.loadLabel(pm).toString() }
@@ -159,7 +171,7 @@ fun HomeScreen() {
                         val icon = runCatching {
                             drawableToBitmap(pm.getApplicationIcon(app.packageName)).asImageBitmap()
                         }.getOrNull()
-                        AppEntry(app.packageName, label, size, icon, selected = selectAll)
+                        AppEntry(app.packageName, label, size, icon, selected = prevSel[app.packageName] ?: selectAll)
                     }
                 }.sortedByDescending { it.cacheBytes }
             }
@@ -182,6 +194,8 @@ fun HomeScreen() {
         val notes = mutableListOf<String>()
         var okCount = 0
         var method = ""
+        var diag = ""
+        var sizesBefore: Map<String, Long> = emptyMap()
         try {
             val iPm = withContext(Dispatchers.IO) { runCatching { ShizukuCache.iPm() }.getOrNull() }
 
@@ -198,10 +212,19 @@ fun HomeScreen() {
             }
 
             suspend fun account(entry: AppEntry, before: Long, ok: Boolean) {
-                results[entry.packageName] = ok
-                if (!ok) return
+                var good = ok
+                var after = -1L
+                if (ok) {
+                    after = querySize(entry.packageName)
+                    if (before > 0L && after >= before) {
+                        delay(300) // usage stats can lag a little behind the delete
+                        after = querySize(entry.packageName)
+                        if (after >= before) good = false
+                    }
+                }
+                results[entry.packageName] = good
+                if (!good) return
                 okCount++
-                val after = querySize(entry.packageName)
                 freedBytes += when {
                     before <= 0L -> 0L
                     after in 0L..before -> before - after
@@ -214,32 +237,39 @@ fun HomeScreen() {
             val first = targets.first()
             currentLabel = first.label
             currentIcon = first.icon
-            statusLine = "TESTING CLEAR METHOD"
             val firstBefore = if (first.cacheBytes > 0L) first.cacheBytes else querySize(first.packageName)
-            for (m in listOf("API", "SHELL")) {
-                val r = runMethod(m, first.packageName)
-                var worked = r.ok
-                var note = r.note
-                if (worked && firstBefore > 0L) {
-                    var after = querySize(first.packageName)
-                    if (after >= firstBefore) {
-                        delay(500) // usage stats can lag a little behind the delete
-                        after = querySize(first.packageName)
+            if (perAppBlocked) {
+                notes += "PER-APP: skipped (blocked earlier)"
+            } else {
+                statusLine = "TESTING CLEAR METHOD"
+                for (m in listOf("API", "SHELL")) {
+                    val r = runMethod(m, first.packageName)
+                    var worked = r.ok
+                    var note = r.note
+                    if (firstBefore > 0L) {
+                        var after = querySize(first.packageName)
+                        if (after >= firstBefore && worked) {
+                            delay(500) // usage stats can lag a little behind the delete
+                            after = querySize(first.packageName)
+                        }
+                        if (after in 0L until firstBefore) {
+                            if (!worked) note = "size dropped anyway (" + note + ")"
+                            worked = true
+                        } else if (worked) {
+                            worked = false
+                            note = "reported ok but cache size did not change"
+                        }
                     }
-                    if (after >= firstBefore) {
-                        worked = false
-                        note = "reported ok but cache size did not change"
+                    notes += "$m: " + (if (worked) "ok" else note)
+                    if (worked) {
+                        method = m
+                        break
                     }
                 }
-                notes += "$m: " + (if (worked) "ok" else note)
-                if (worked) {
-                    method = m
-                    break
-                }
+                if (method.isEmpty()) perAppBlocked = true
             }
 
             // Step 2: run the working method on every selected app, or trim everything.
-            var trimOk = false
             if (method.isNotEmpty()) {
                 account(first, firstBefore, true)
                 for ((i, entry) in targets.withIndex()) {
@@ -255,9 +285,13 @@ fun HomeScreen() {
                 }
             } else {
                 method = "TRIM"
-                statusLine = "PER-APP BLOCKED - TRIMMING ALL"
                 currentLabel = "All apps"
                 currentIcon = null
+                statusLine = "PER-APP BLOCKED - CHECKING"
+                progress = 0.2f
+                diag = ShizukuCache.diagnose(pm)
+                sizesBefore = sweep()
+                statusLine = "PER-APP BLOCKED - TRIMMING ALL"
                 progress = 0.5f
                 var r = ShizukuCache.trimAllShell()
                 notes += "TRIM shell: " + (if (r.ok) "ok" else r.note)
@@ -265,21 +299,37 @@ fun HomeScreen() {
                     r = ShizukuCache.trimAllApi(iPm)
                     notes += "TRIM api: " + (if (r.ok) "ok" else r.note)
                 }
-                trimOk = r.ok
+                statusLine = "CLEARING EXTERNAL CACHES"
+                progress = 0.8f
+                val er = ShizukuCache.clearExternalCacheShell(targets.map { it.packageName })
+                notes += "EXTERNAL: " + (if (er.ok) er.note else "failed " + er.note)
             }
 
             progress = 1f
             refresh()
 
             if (method == "TRIM") {
-                // Judge each app by its size after the trim.
+                // Judge everything by real before/after sizes.
+                val afterMap = apps.associate { it.packageName to it.cacheBytes }
+                var allFreed = 0L
+                var changed = 0
+                for ((pkg, b) in sizesBefore) {
+                    if (b <= 0L) continue
+                    val a = afterMap[pkg] ?: 0L
+                    if (a in 0L until b) {
+                        allFreed += b - a
+                        changed++
+                    }
+                }
+                notes += "ALL APPS: freed " + formatBytes(allFreed) + " in " + changed + " apps"
                 for (t in targets) {
-                    val after = apps.firstOrNull { it.packageName == t.packageName }?.cacheBytes ?: 0L
-                    val ok = if (t.cacheBytes > 0L) after in 0L until t.cacheBytes else trimOk
+                    val b = sizesBefore[t.packageName] ?: t.cacheBytes
+                    val a = afterMap[t.packageName] ?: 0L
+                    val ok = b > 0L && a in 0L until b
                     results[t.packageName] = ok
                     if (ok) {
                         okCount++
-                        freedBytes += (t.cacheBytes - after).coerceAtLeast(0L)
+                        freedBytes += b - a
                     }
                 }
             }
@@ -287,7 +337,7 @@ fun HomeScreen() {
             val methodLabel = when (method) {
                 "API" -> "DIRECT API"
                 "SHELL" -> "SHELL COMMAND"
-                "TRIM" -> "TRIM ALL CACHES"
+                "TRIM" -> "TRIM ALL + EXTERNAL"
                 else -> "NONE"
             }
             statusLine = "DONE"
@@ -296,6 +346,7 @@ fun HomeScreen() {
                 append("  |  FREED ").append(formatBytes(freedBytes))
                 append("\nMETHOD: ").append(methodLabel)
                 for (n in notes) append("\n").append(n)
+                if (diag.isNotEmpty()) append("\n").append(diag)
             }
         } catch (e: CancellationException) {
             throw e
@@ -325,6 +376,9 @@ fun HomeScreen() {
     }
     LaunchedEffect(shizukuAlive, granted) {
         if (shizukuAlive && granted && apps.isEmpty() && !loading) refresh()
+    }
+    LaunchedEffect(statsGranted) {
+        if (statsGranted && shizukuAlive && granted && !clearing && !loading) refresh()
     }
 
     Column(Modifier.fillMaxSize().padding(horizontal = 20.dp, vertical = 14.dp)) {
@@ -486,7 +540,7 @@ fun HomeScreen() {
                 if (!clearing && report.isNotEmpty()) {
                     Spacer(Modifier.height(10.dp))
                     NeuCard(Modifier.fillMaxWidth(), corner = 18.dp, pad = 12.dp) {
-                        Text(report, color = TextS, fontSize = 11.sp, maxLines = 10)
+                        Text(report, color = TextS, fontSize = 11.sp, maxLines = 20, modifier = Modifier.fillMaxWidth())
                     }
                 }
 
